@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	asset "cloud.google.com/go/asset/apiv1"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/cloudresourcemanager/v1"
@@ -36,6 +37,7 @@ import (
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 	"google.golang.org/api/servicemanagement/v1"
+	assetpb "google.golang.org/genproto/googleapis/cloud/asset/v1"
 )
 
 const (
@@ -49,6 +51,8 @@ const (
 	MaxProjectAgeHours            = "MAX_PROJECT_AGE_HOURS"
 	targetFolderRegexp            = `^[0-9]+$`
 	targetOrganizationRegexp      = `^[0-9]+$`
+	CleanUpCaiFeeds               = "CLEAN_UP_CAI_FEEDS"
+	TargetIncludedFeeds           = "TARGET_INCLUDED_FEEDS"
 )
 
 var (
@@ -60,6 +64,8 @@ var (
 	resourceCreationCutoff = getOldTime(int64(getCorrectMaxAgeInHoursOrTerminateExecution()) * 60 * 60)
 	rootFolderId           = getCorrectFolderIdOrTerminateExecution()
 	organizationId         = getCorrectOrganizationIdOrTerminateExecution()
+	cleanUpCaiFeeds        = getCleanUpFeedsOrTerminateExecution()
+	includedFeedsList      = getFeedsListFromEnv(TargetIncludedFeeds)
 )
 
 type PubSubMessage struct {
@@ -175,6 +181,19 @@ func checkIfTagKeyShortNameExcluded(shortName string, excludedTagKeys []string) 
 	return false
 }
 
+func checkIfCaiFeedsShortNameIncluded(shortName string, includedFeeds []*regexp.Regexp) bool {
+	if len(includedFeeds) == 0 {
+		return false
+	}
+
+	for _, regex := range includedFeeds {
+		if regex.MatchString(shortName) {
+			return true
+		}
+	}
+	return false
+}
+
 func getLabelsMapFromEnv(envVariableName string) map[string]string {
 	targetExcludedLabels := os.Getenv(envVariableName)
 	logger.Println("Try to get labels map")
@@ -220,6 +239,46 @@ func getCleanUpTagKeysOrTerminateExecution() bool {
 	result, err := strconv.ParseBool(cleanUpTagKeys)
 	if err != nil {
 		logger.Fatalf("Invalid Clean up Tag Keys value [%s], specify correct value for environment variable [%s] and try again.", cleanUpTagKeys, CleanUpTagKeys)
+	}
+	return result
+}
+
+func getFeedsListFromEnv(envVariableName string) []*regexp.Regexp {
+	targetIncludedFeeds := os.Getenv(envVariableName)
+	logger.Println("Try to get CAI Feeds list")
+	if targetIncludedFeeds == "" {
+		logger.Printf("No CAI Feeds provided.")
+		return nil
+	}
+
+	var caiFeeds []string
+	err := json.Unmarshal([]byte(targetIncludedFeeds), &caiFeeds)
+	if err != nil {
+		logger.Printf("Failed to get CAI Feeds list from [%s] env variable, error [%s]", envVariableName, err.Error())
+		return nil
+	}
+
+	regexFeeds := make([]*regexp.Regexp, len(caiFeeds))
+	for i, feed := range caiFeeds {
+		regexFeeds[i], err = regexp.Compile(feed)
+		if err != nil {
+			logger.Printf("Failed to compile regex for CAI Feed [%s], error [%s]", feed, err.Error())
+			regexFeeds[i] = regexp.MustCompile(".*")
+		}
+	}
+
+	logger.Printf("Got CAI Feeds list [%v] from [%s] env variable", regexFeeds, envVariableName)
+	return regexFeeds
+}
+
+func getCleanUpFeedsOrTerminateExecution() bool {
+	cleanUpCaiFeeds, exists := os.LookupEnv(CleanUpCaiFeeds)
+	if !exists {
+		logger.Fatalf("Clean up CAI Feeds environment variable [%s] not set, set the environment variable and try again.", CleanUpCaiFeeds)
+	}
+	result, err := strconv.ParseBool(cleanUpCaiFeeds)
+	if err != nil {
+		logger.Fatalf("Invalid Clean up CAI Feeds value [%s], specify correct value for environment variable [%s] and try again.", cleanUpCaiFeeds, CleanUpCaiFeeds)
 	}
 	return result
 }
@@ -290,6 +349,16 @@ func getTagValuesServiceOrTerminateExecution(ctx context.Context, client *http.C
 	return cloudResourceManagerService.TagValues
 }
 
+func getAssetServiceOrTerminateExecution(ctx context.Context, client *http.Client) *asset.Client {
+	logger.Println("Try to get Asset Service")
+	assetService, err := asset.NewClient(ctx)
+	if err != nil {
+		logger.Fatalf("Failed to get Asset Service with error [%s], terminate execution", err.Error())
+	}
+	logger.Println("Got Asset Service")
+	return assetService
+}
+
 func getFirewallPoliciesServiceOrTerminateExecution(ctx context.Context, client *http.Client) *compute.FirewallPoliciesService {
 	logger.Println("Try to get Firewall Policies Service")
 	computeService, err := compute.NewService(ctx, option.WithHTTPClient(client))
@@ -316,6 +385,7 @@ func invoke(ctx context.Context) {
 	folderService := getFolderServiceOrTerminateExecution(ctx, client)
 	tagKeyService := getTagKeysServiceOrTerminateExecution(ctx, client)
 	tagValuesService := getTagValuesServiceOrTerminateExecution(ctx, client)
+	feedsService := getAssetServiceOrTerminateExecution(ctx, client)
 	firewallPoliciesService := getFirewallPoliciesServiceOrTerminateExecution(ctx, client)
 	endpointService := getServiceManagementServiceOrTerminateExecution(ctx, client)
 
@@ -336,6 +406,18 @@ func invoke(ctx context.Context) {
 			return false
 		}
 		return tagKeyCreatedAt.Before(resourceCreationCutoff)
+	}
+
+	projectDeleteRequestedFilter := func(projectID string) bool {
+		p, err := cloudResourceManagerService.Projects.Get(projectID).Context(ctx).Do()
+		if err != nil {
+			logger.Printf("Failed to get project [%s], error [%s]", projectID, err.Error())
+			return false
+		}
+		if p.LifecycleState == "DELETE_REQUESTED" {
+			return true
+		}
+		return false
 	}
 
 	removeTagValues := func(tagKey string) {
@@ -367,6 +449,35 @@ func invoke(ctx context.Context) {
 				_, err := tagKeyService.Delete(tagKey.Name).Context(ctx).Do()
 				if err != nil {
 					logger.Printf("Failed to delete tagKey from organization [%s], error [%s]", organization, err.Error())
+				}
+			}
+		}
+	}
+
+	removeFeedsByName := func(organization string) {
+		logger.Printf("Try to remove feeds from organization [%s]", organization)
+
+		req := &assetpb.ListFeedsRequest{
+			Parent: fmt.Sprintf("organizations/%s", organization),
+		}
+
+		resp, err := feedsService.ListFeeds(ctx, req)
+		if err != nil {
+			logger.Printf("Failed to list Feeds, error [%s]", err.Error())
+			return
+		}
+
+		for _, feed := range resp.Feeds {
+			projectID := strings.Split(feed.FeedOutputConfig.GetPubsubDestination().Topic, "/")[1]
+			if checkIfCaiFeedsShortNameIncluded(feed.Name, includedFeedsList) && projectDeleteRequestedFilter(projectID) {
+				delReq := &assetpb.DeleteFeedRequest{
+					Name: feed.Name,
+				}
+				err := feedsService.DeleteFeed(ctx, delReq)
+				if err != nil {
+					logger.Printf("Failed to remove the feed [%s], error [%s]", feed.Name, err.Error())
+				} else {
+					logger.Printf("Feed [%s] successfully removed.", feed.Name)
 				}
 			}
 		}
@@ -516,6 +627,11 @@ func invoke(ctx context.Context) {
 	// Only Tag Keys whose values are not in use can be deleted.
 	if cleanUpTagKeys {
 		removeTagKeys(organizationId)
+	}
+
+	//Only delete Feeds from deleted projects
+	if cleanUpCaiFeeds {
+		removeFeedsByName(organizationId)
 	}
 }
 
